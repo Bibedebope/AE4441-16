@@ -2,41 +2,148 @@
 import gurobipy as gp
 from gurobipy import GRB
 
+
+def flights_overlap(f1, f2):
+    """Check if two flights overlap in time (cannot share a gate)."""
+    return not (f1['d'] <= f2['a'] or f2['d'] <= f1['a'])
+
+
 def compute_NA_star(flights, gate_count_fixed, terminal_tag):
     """
     Computes minimum number of flights needing apron for one terminal.
-    Uses a simpler time-interval model:
-      max  sum u_i
-      s.t. for each time interval r: sum_{i present} u_i ≤ gate_count_fixed
-    NA* = total flights - max fixed-gate flights.
+    
+    Uses the maximum cost network flow model from the paper (Section 3):
+    - Nodes: source (0), aircraft (1 to |I|), sink (|I|+1)
+    - Arcs A: (0,j) for all aircraft j, (i,|I|+1) for all aircraft i,
+              and (i,j) between non-overlapping aircraft pairs
+    - All arc weights = 1
+    - Decision variable: z_ij = 1 if arc (i,j) is selected
+    
+    Mathematical formulation:
+        Max Z = sum_{(i,j) in A} z_ij                           (maximize arcs visited)
+        s.t.
+        sum_{(0,j) in A} z_0j <= |K| - 1                        (flow from source)
+        sum_{(i,|I|+1) in A} z_{i,|I|+1} <= |K| - 1             (flow to sink)
+        sum_{(i,j) in A} z_ij = sum_{(j,i) in A} z_ji, i=1..|I| (flow conservation)
+        sum_{(i,j) in A} z_ij <= 1, i=1..|I|                    (each aircraft visited once)
+        z_ij in {0,1}
+    
+    Key insight from paper: K includes apron, so |K| - 1 = number of FIXED gates.
+    Since gate_count_fixed already represents fixed gates only, we use it directly.
+    
+    Each path from source to sink represents a chain of non-overlapping aircraft
+    that can be assigned to ONE fixed gate. With |K|-1 paths (= fixed gate count),
+    we cover the maximum aircraft using all fixed gates.
+    
+    NA* (for this terminal) = |I| - (number of aircraft covered by paths)
+    
+    Args:
+        flights: list of flight dicts
+        gate_count_fixed: number of fixed gates (NOT including apron)
+        terminal_tag: 'D' or 'I'
     """
     term_flights = [f for f in flights if f['terminal'] == terminal_tag]
-    nF = len(term_flights)
-    if nF == 0:
+    n_flights = len(term_flights)
+    
+    if n_flights == 0:
         return 0
-
-    times = sorted({f['a'] for f in term_flights}.union({f['d'] for f in term_flights}))
-    intervals = [(times[r], times[r+1]) for r in range(len(times)-1)]
-
-    m = gp.Model(f"MaxFixed_{terminal_tag}")
+    
+    # Node indices: 0 = source, 1..n_flights = aircraft, n_flights+1 = sink
+    source = 0
+    sink = n_flights + 1
+    aircraft_nodes = list(range(1, n_flights + 1))
+    
+    # Map flight id to node index and vice versa
+    flight_to_node = {term_flights[i]['id']: i + 1 for i in range(n_flights)}
+    node_to_flight = {i + 1: term_flights[i] for i in range(n_flights)}
+    
+    # Build arc set A_D (or A_I for international)
+    # Arcs: (source, j) for all aircraft j
+    #       (i, sink) for all aircraft i  
+    #       (i, j) for non-overlapping pairs where i < j (to avoid duplicates)
+    arcs = []
+    
+    # Arcs from source to each aircraft
+    for j in aircraft_nodes:
+        arcs.append((source, j))
+    
+    # Arcs from each aircraft to sink
+    for i in aircraft_nodes:
+        arcs.append((i, sink))
+    
+    # Arcs between non-overlapping aircraft pairs
+    # Arc (i,j) exists only if flight i can be followed by flight j at the same gate
+    # This requires: fi departs before or when fj arrives (fi['d'] <= fj['a'])
+    for i in aircraft_nodes:
+        for j in aircraft_nodes:
+            if i != j:
+                fi = node_to_flight[i]
+                fj = node_to_flight[j]
+                # Arc from i to j only if fi finishes before/when fj starts
+                if fi['d'] <= fj['a']:
+                    arcs.append((i, j))
+    
+    # Build the optimization model
+    m = gp.Model(f"MaxCostFlow_{terminal_tag}")
     m.Params.OutputFlag = 0
-
-    u = m.addVars([f['id'] for f in term_flights], vtype=GRB.BINARY, name="u")
-
-    # Interval capacity constraints
-    for r, (t0, t1) in enumerate(intervals):
-        present = [f['id'] for f in term_flights if f['a'] < t1 and f['d'] > t0]
-        if present:
-            m.addConstr(gp.quicksum(u[i] for i in present) <= gate_count_fixed, name=f"cap_{r}")
-
-    m.setObjective(gp.quicksum(u[i] for i in u.keys()), GRB.MAXIMIZE)
+    
+    # Decision variables: z_ij for each arc
+    z = {(i, j): m.addVar(vtype=GRB.BINARY, name=f"z_{i}_{j}") for (i, j) in arcs}
+    
+    # Constraint: flow out of source <= |K| - 1 = gate_count_fixed
+    # (K includes apron, so |K|-1 = number of fixed gates)
+    source_out_arcs = [(i, j) for (i, j) in arcs if i == source]
+    m.addConstr(
+        gp.quicksum(z[arc] for arc in source_out_arcs) <= gate_count_fixed,
+        name="source_flow"
+    )
+    
+    # Constraint: flow into sink <= |K| - 1 = gate_count_fixed
+    sink_in_arcs = [(i, j) for (i, j) in arcs if j == sink]
+    m.addConstr(
+        gp.quicksum(z[arc] for arc in sink_in_arcs) <= gate_count_fixed,
+        name="sink_flow"
+    )
+    
+    # Constraint: flow conservation at each aircraft node
+    # sum of incoming arcs = sum of outgoing arcs
+    for node in aircraft_nodes:
+        in_arcs = [(i, j) for (i, j) in arcs if j == node]
+        out_arcs = [(i, j) for (i, j) in arcs if i == node]
+        m.addConstr(
+            gp.quicksum(z[arc] for arc in in_arcs) == gp.quicksum(z[arc] for arc in out_arcs),
+            name=f"flow_conserve_{node}"
+        )
+    
+    # Constraint: each aircraft can be visited at most once (outflow <= 1)
+    for node in aircraft_nodes:
+        out_arcs = [(i, j) for (i, j) in arcs if i == node]
+        m.addConstr(
+            gp.quicksum(z[arc] for arc in out_arcs) <= 1,
+            name=f"visit_once_{node}"
+        )
+    
+    # Objective: maximize total arcs selected (all weights = 1)
+    m.setObjective(gp.quicksum(z[arc] for arc in arcs), GRB.MAXIMIZE)
+    
     m.optimize()
-
+    
     if m.Status != GRB.OPTIMAL:
         raise RuntimeError(f"NA* subproblem infeasible or not optimal (status {m.Status}).")
-
+    
     Z_star = m.ObjVal
-    return int(nF - Z_star)
+    
+    # The paper states: max aircraft assignable to |K|-1 gates = Z*
+    # So NA* = n_flights - (aircraft covered by the flow)
+    # Note: Z* counts arcs, but aircraft covered = arcs through aircraft nodes
+    # Each aircraft visited contributes 2 arcs (in + out), plus source/sink arcs
+    # Actually, aircraft assigned = number of aircraft nodes with flow through them
+    
+    # Count aircraft that are part of a path (have outgoing flow)
+    aircraft_assigned = sum(1 for node in aircraft_nodes 
+                           if any(z[(i, j)].X > 0.5 for (i, j) in arcs if i == node))
+    
+    return int(n_flights - aircraft_assigned)
 
 
 def build_linear_AGAP_model(flights, p_matrix, gates_D, gates_I, apron_gate,
