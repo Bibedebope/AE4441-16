@@ -3,9 +3,6 @@ import gurobipy as gp
 from gurobipy import GRB
 
 
-def flights_overlap(f1, f2):
-    """Check if two flights overlap in time (cannot share a gate)."""
-    return not (f1['d'] <= f2['a'] or f2['d'] <= f1['a'])
 
 
 def compute_NA_star(flights, gate_count_fixed, terminal_tag):
@@ -232,27 +229,36 @@ def build_linear_AGAP_model(flights, p_matrix, gates_D, gates_I, apron_gate,
 
 
 if __name__ == "__main__":
-    flights = [
-        {'id': 'F1', 'terminal': 'D', 'a': 0, 'd': 5, 'e': 80, 'f': 75},
-        {'id': 'F2', 'terminal': 'D', 'a': 2, 'd': 7, 'e': 60, 'f': 50},
-        {'id': 'F3', 'terminal': 'I', 'a': 1, 'd': 6, 'e': 120, 'f': 110},
-        {'id': 'F4', 'terminal': 'I', 'a': 6, 'd': 10, 'e': 90, 'f': 95},
+    base_flights = [
+        {'id': 'F1', 'terminal': 'D', 'a': 0, 'd': 60, 'e': 150, 'f': 140},
+        {'id': 'F2', 'terminal': 'D', 'a': 20, 'd': 80, 'e': 120, 'f': 110},
+        {'id': 'F3', 'terminal': 'D', 'a': 50, 'd': 110, 'e': 100, 'f': 95},  # Overlaps with F1 and F2 at t=50-60
+        {'id': 'F4', 'terminal': 'D', 'a': 90, 'd': 160, 'e': 80, 'f': 75},
+        {'id': 'F5', 'terminal': 'I', 'a': 0, 'd': 50, 'e': 200, 'f': 180},
+        {'id': 'F6', 'terminal': 'I', 'a': 30, 'd': 90, 'e': 160, 'f': 150},  # Overlaps with F5 at t=30-50
+        {'id': 'F7', 'terminal': 'I', 'a': 60, 'd': 120, 'e': 140, 'f': 130},  # Overlaps with F6 at t=60-90
+        {'id': 'F8', 'terminal': 'I', 'a': 100, 'd': 180, 'e': 110, 'f': 100},
     ]
-    p_matrix = {
-        ('F1', 'F2'): 30,
-        ('F1', 'F3'): 10,
-        ('F3', 'F4'): 40,
+    
+    base_p_matrix = {
+        ('F1', 'F2'): 25, ('F1', 'F3'): 15, ('F1', 'F5'): 30,
+        ('F2', 'F3'): 20, ('F2', 'F4'): 10,
+        ('F3', 'F4'): 25,
+        ('F5', 'F6'): 35, ('F5', 'F7'): 20,
+        ('F6', 'F7'): 30, ('F6', 'F8'): 15,
+        ('F7', 'F8'): 25,
     }
-    gates_D = ['D1', 'D2']
-    gates_I = ['I1']
+    
+    base_gates_D = ['D1', 'D2']
+    base_gates_I = ['I1', 'I2']
     apron_gate = 'APR'
-    all_gates = gates_D + gates_I + [apron_gate]
+    all_gates = base_gates_D + base_gates_I + [apron_gate]
 
     dist_gate_gate = {(g1, g2): (10 if g1 == g2 else 100) for g1 in all_gates for g2 in all_gates}
     dist_gate_entrance = {g: (20 if g != apron_gate else 400) for g in all_gates}
 
     model, x, y, NA_star = build_linear_AGAP_model(
-        flights, p_matrix, gates_D, gates_I, apron_gate,
+        base_flights, base_p_matrix, base_gates_D, base_gates_I, apron_gate,
         dist_gate_gate, dist_gate_entrance
     )
     # Write LP before solve
